@@ -63,12 +63,15 @@ export async function telegramRoutes(app: FastifyInstance) {
         if (!text) return;
 
         try {
-            // /start — приветствие
+            // /start — запускаем Voiceflow флоу через launch
             if (text === '/start') {
-                await telegramSendMessage(
-                    chatId,
-                    'Привет! Я антикурительный бот. Напиши, что тебя сейчас тянет закурить или какая ситуация была.'
-                );
+                const vf = await voiceflowInteract({ userId, launch: true });
+
+                const answer =
+                    (vf.text ?? '').trim() ||
+                    'Привет! Сколько времени ты не куришь? (например: 3 дня / 2 недели / 1 месяц)';
+
+                await telegramSendMessage(chatId, answer);
                 return;
             }
 
@@ -85,15 +88,16 @@ export async function telegramRoutes(app: FastifyInstance) {
             const vf = await voiceflowInteract({ userId, text });
 
             // Если Voiceflow вернул пусто — подстрахуемся
-            const answer = (vf.text ?? '').trim() || 'Ок. Расскажи подробнее, что сейчас происходит?';
+            const answer = (vf.text ?? '').trim() || 'Ок. Сколько времени ты не куришь?';
 
             await telegramSendMessage(chatId, answer);
         } catch (e: any) {
             app.log.error({ err: e }, 'Telegram webhook error');
+
             try {
                 await telegramSendMessage(chatId, 'Упс, ошибка на сервере. Попробуй ещё раз через минуту.');
             } catch {
-                // Если даже Telegram sendMessage упал — молча, чтобы не зациклиться
+                // если даже sendMessage упал — молча, чтобы не зациклиться
             }
         }
     });
