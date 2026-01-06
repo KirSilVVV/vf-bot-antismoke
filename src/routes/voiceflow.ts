@@ -7,48 +7,22 @@ const BodySchema = z.object({}).passthrough();
 
 export async function voiceflowRoutes(app: FastifyInstance) {
     app.post('/api/voiceflow/webhook', async (req, reply) => {
-        /* =========================
-           1. Проверка секрета
-        ========================= */
+        // 1) Проверка секрета
         const secret = req.headers['x-vf-secret'];
 
         if (secret !== env.VOICEFLOW_WEBHOOK_SECRET) {
-            app.log.warn(
-                { receivedSecret: secret },
-                'Voiceflow webhook: invalid secret'
-            );
-
-            return reply.code(401).send({
-                error: 'Unauthorized',
-            });
+            app.log.warn({ receivedSecret: secret }, 'Voiceflow webhook: invalid secret');
+            return reply.code(401).send({ error: 'Unauthorized' });
         }
 
-        /* =========================
-           2. Парсинг body
-        ========================= */
+        // 2) Парсинг body
         const body = BodySchema.parse(req.body ?? {});
 
-        app.log.info(
-            {
-                headers: req.headers,
-                body,
-            },
-            'Voiceflow webhook received'
-        );
+        app.log.info({ headers: req.headers, body }, 'Voiceflow webhook received');
 
-        /* =========================
-           3. Тестовый ответ для Voiceflow
-           (ЭТА ЧАСТЬ НУЖНА СЕЙЧАС)
-        ========================= */
+        // 3) Тестовый ответ
         return reply.send({
-            text: '✅ Связь с сервером установлена. Voiceflow → backend → Voiceflow работает.',
+            text: '✅ Связь с сервером установлена. Voiceflow → backend → Voiceflow работает.'
         });
-
-        /* =========================
-           4. Дальше здесь будет:
-           - извлечение переменных из Voiceflow
-           - вызов ChatGPT
-           - возврат рекомендаций
-        ========================= */
     });
 }
