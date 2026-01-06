@@ -6,20 +6,45 @@ import { telegramRoutes } from './routes/telegram';
 
 async function bootstrap() {
     const app = Fastify({
-        logger: true, // ← ВАЖНО: просто true
+        logger: true, // безопасно для Render / production
     });
 
+    /**
+     * Root route — нужен для Render healthcheck
+     */
+    app.get('/', async () => {
+        return {
+            ok: true,
+            service: 'vf-bot-antismoke',
+            status: 'running',
+        };
+    });
+
+    /**
+     * HEAD / — чтобы Render не спамил 404
+     */
+    app.head('/', async (_req, reply) => {
+        reply.code(200).send();
+    });
+
+    /**
+     * API routes
+     */
     app.register(healthRoutes);
     app.register(voiceflowRoutes);
     app.register(telegramRoutes);
 
+    /**
+     * Start server
+     */
     try {
+        const port = env.PORT;
         await app.listen({
-            port: env.PORT,
-            host: '0.0.0.0',
+            port,
+            host: '0.0.0.0', // ОБЯЗАТЕЛЬНО для Render
         });
 
-        app.log.info(`Server running on port ${env.PORT}`);
+        app.log.info(`🚀 Server running on port ${port}`);
     } catch (err) {
         app.log.error(err);
         process.exit(1);
