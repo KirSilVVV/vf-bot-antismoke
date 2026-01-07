@@ -24,7 +24,8 @@ type VoiceflowRuntimeResponseItem = {
 
 export type VFButton = {
     title: string;
-    payload: string; // что отправляем обратно в VF при клике
+    payload: string; // JSON строка с полным request объектом
+    request?: any; // сохраняем оригинальный request для отладки
 };
 
 export type VFResult = {
@@ -62,13 +63,20 @@ function payloadToString(payload: any, fallback: string) {
 export async function voiceflowInteract(params: {
     userId: string;
     text?: string;
+    action?: any;
     launch?: boolean;
 }): Promise<VFResult> {
-    const { userId, text, launch } = params;
+    const { userId, text, action: customAction, launch } = params;
 
-    const action = launch
-        ? ({ type: 'launch' } as const)
-        : ({ type: 'text', payload: text ?? '' } as const);
+    let action: any;
+    if (customAction) {
+        // Используем переданный action (для callback кнопок)
+        action = customAction;
+    } else if (launch) {
+        action = { type: 'launch' } as const;
+    } else {
+        action = { type: 'text', payload: text ?? '' } as const;
+    }
 
     const vfUrl = `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`;
     
@@ -121,10 +129,12 @@ export async function voiceflowInteract(params: {
                 const title = (b.name ?? '').trim();
                 if (!title) continue;
 
-                const payloadRaw = b.request?.payload;
-                const payload = payloadToString(payloadRaw, title).trim() || title;
+                // ✅ ВАЖНО: сохраняем весь request объект как payload
+                // Voiceflow ожидает: { type: request.type, payload: request.payload }
+                const requestObj = b.request ?? { type: 'text', payload: title };
+                const payload = JSON.stringify(requestObj);
 
-                buttons.push({ title, payload });
+                buttons.push({ title, payload, request: requestObj });
             }
         }
 
@@ -142,10 +152,10 @@ export async function voiceflowInteract(params: {
                     const title = (b.name ?? '').trim();
                     if (!title) continue;
 
-                    const payloadRaw = b.request?.payload;
-                    const payload = payloadToString(payloadRaw, title).trim() || title;
+                    const requestObj = b.request ?? { type: 'text', payload: title };
+                    const payload = JSON.stringify(requestObj);
 
-                    buttons.push({ title, payload });
+                    buttons.push({ title, payload, request: requestObj });
                 }
             }
         }

@@ -190,8 +190,27 @@ export async function telegramRoutes(app: FastifyInstance) {
             const tokenOrPayload = update.callback_query.data;
             const payload = getCallbackPayload(tokenOrPayload); // <-- вот это обычно и чинит "Sorry, I didn’t get that"
             app.log.info({ tokenOrPayload, payload }, '[CALLBACK] Button clicked');
+
+            // ✅ Парсим payload как JSON (может быть весь request объект)
+            let action: any = { type: 'text', payload };
             try {
-                const vf = await voiceflowInteract({ userId, text: payload });
+                const parsed = JSON.parse(payload);
+                if (parsed.type && parsed.payload) {
+                    // Это полный request объект от Voiceflow
+                    action = parsed;
+                    app.log.info({ action }, '[CALLBACK] Parsed request action');
+                } else {
+                    // Это просто текст или старый формат
+                    action = { type: 'text', payload: payload };
+                }
+            } catch {
+                // Если не JSON — это просто текст
+                action = { type: 'text', payload };
+            }
+
+            try {
+                // Отправляем action вместо text
+                const vf = await voiceflowInteract({ userId, action });
                 const out = buildReply(vf);
                 await telegramSendMessage(chatId, out.text, out.buttons);
             } catch (e: any) {
