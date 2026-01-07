@@ -1,26 +1,77 @@
 import { env } from '../config/env';
 
-type VFMessage =
-    | { type: 'text'; payload?: { message?: string } }
-    | { type: 'choice'; payload?: { buttons?: Array<{ name?: string; request?: { payload?: string } }> } }
-    | { type: string; payload?: any };
-
-type VoiceflowRuntimeResponseItem = {
-    type?: string;
-    text?: string;
-    messages?: VFMessage[];
-    payload?: any;
-};
+type AnyObj = Record<string, any>;
 
 export type VFButton = {
     title: string;
-    payload: string; // что отправим обратно в VF при клике
+    payload: string;
 };
 
 export type VFResult = {
-    text: string;
+    text: string;          // может быть пустым, это нормально
     buttons: VFButton[];
 };
+
+function pickTextFromPayload(payload: any): string[] {
+    const out: string[] = [];
+    if (!payload) return out;
+
+    // 1) самый частый кейс
+    if (typeof payload.message === 'string' && payload.message.trim()) {
+        out.push(payload.message.trim());
+    }
+
+    // 2) иногда бывает просто payload.text
+    if (typeof payload.text === 'string' && payload.text.trim()) {
+        out.push(payload.text.trim());
+    }
+
+    // 3) иногда Voiceflow отдаёт slate/blocks (структурированно)
+    // Тут мы не делаем “красивый рендер”, но хотя бы достанем видимый текст
+    // из типичных полей.
+    const slate = payload.slate ?? payload.richText ?? payload.blocks;
+    if (slate) {
+        try {
+            const str = JSON.stringify(slate);
+            // очень грубо: вытащим куски "text":"..."
+            const matches = [...str.matchAll(/"text"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
+            for (const t of matches) {
+                const cleaned = t.replace(/\\n/g, '\n').trim();
+                if (cleaned) out.push(cleaned);
+            }
+        } catch {
+            // ignore
+        }
+    }
+
+    return out;
+}
+
+function pickButtonsFromChoicePayload(payload: any): VFButton[] {
+    const buttons: VFButton[] = [];
+    if (!payload) return buttons;
+
+    const rawButtons =
+        payload.buttons ??
+        payload.choices ??
+        payload.options;
+
+    if (!Array.isArray(rawButtons)) return buttons;
+
+    for (const b of rawButtons) {
+        const title =
+            String(b?.name ?? b?.label ?? b?.text ?? '').trim();
+
+        if (!title) continue;
+
+        const vfPayload =
+            String(b?.request?.payload ?? b?.payload ?? title).trim();
+
+        buttons.push({ title, payload: vfPayload });
+    }
+
+    return buttons;
+}
 
 export async function voiceflowInteract(params: {
     userId: string;
@@ -47,44 +98,52 @@ export async function voiceflowInteract(params: {
 
     if (!res.ok) {
         const errText = await res.text().catch(() => '');
-        throw new Error(`Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`);
+        throw new Error(
+            `Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`
+        );
     }
 
-    const data = (await res.json()) as VoiceflowRuntimeResponseItem[];
+    const data = (await res.json()) as AnyObj[];
 
     const texts: string[] = [];
     const buttons: VFButton[] = [];
 
     for (const item of data) {
-        if (item.text) texts.push(item.text);
+        // A) иногда текст лежит в item.text
+        if (typeof item?.text === 'string' && item.text.trim()) {
+            texts.push(item.text.trim());
+        }
 
-        const msgs = item.messages ?? [];
+        // B) часто текст лежит в item.payload
+        if (item?.payload) {
+            texts.push(...pickTextFromPayload(item.payload));
+            buttons.push(...pickButtonsFromChoicePayload(item.payload));
+        }
+
+        // C) иногда в item.messages[]
+        const msgs = Array.isArray(item?.messages) ? item.messages : [];
         for (const msg of msgs) {
-            // обычный текст
-            if (msg.type === 'text' && msg.payload?.message) {
-                texts.push(String(msg.payload.message));
+            if (msg?.payload) {
+                texts.push(...pickTextFromPayload(msg.payload));
+                buttons.push(...pickButtonsFromChoicePayload(msg.payload));
             }
 
-            // кнопки/выбор
-            if (msg.type === 'choice' && Array.isArray(msg.payload?.buttons)) {
-                for (const b of msg.payload!.buttons!) {
-                    const title = (b.name ?? '').trim();
-                    if (!title) continue;
-
-                    // payload: лучше отправлять в VF то, что он ожидает.
-                    // Часто достаточно отправить текст кнопки.
-                    const payload = (b.request?.payload ?? title).trim();
-
-                    buttons.push({ title, payload });
-                }
+            // некоторые типы могут быть без payload.message, но с msg.text
+            if (typeof msg?.text === 'string' && msg.text.trim()) {
+                texts.push(msg.text.trim());
             }
         }
     }
 
-    const mergedText = texts.map(t => t.trim()).filter(Boolean).join('\n').trim();
+    const mergedText = texts
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim();
 
+    // ВАЖНО: никаких "Ок 🙂" по умолчанию — пусть телеграм-слой решает, что делать
     return {
-        text: mergedText || 'Ок 🙂',
+        text: mergedText,
         buttons,
     };
 }

@@ -1,3 +1,4 @@
+// src/routes/telegram.ts
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { env } from '../config/env';
@@ -21,6 +22,7 @@ const UpdateSchema = z
 
         callback_query: z
             .object({
+                id: z.string().optional(), // чтобы “снимать часики” у кнопки
                 data: z.string().optional(),
                 message: z
                     .object({
@@ -42,7 +44,8 @@ async function telegramSendMessage(chatId: number, text: string, buttons?: VFBut
                 inline_keyboard: buttons.map((b) => [
                     {
                         text: b.title,
-                        callback_data: b.payload.slice(0, 64), // Telegram лимит 64 байта
+                        // Telegram лимит 64 байта на callback_data
+                        callback_data: String(b.payload ?? '').slice(0, 64),
                     },
                 ]),
             }
@@ -66,7 +69,9 @@ async function telegramSendMessage(chatId: number, text: string, buttons?: VFBut
 }
 
 async function telegramAnswerCallbackQuery(callbackQueryId: string) {
+    if (!callbackQueryId) return;
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+
     await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -74,8 +79,22 @@ async function telegramAnswerCallbackQuery(callbackQueryId: string) {
     }).catch(() => { });
 }
 
+function buildReply(vf: { text?: string; buttons?: VFButton[] }) {
+    const text = (vf.text ?? '').trim();
+    const buttons = Array.isArray(vf.buttons) ? vf.buttons : [];
+
+    // Если VF вернул только кнопки — в телеге надо что-то показать текстом
+    if (!text && buttons.length) return { text: 'Выбери вариант:', buttons };
+
+    // Если вообще пусто — это уже проблема VF/парсинга
+    if (!text && !buttons.length) return { text: 'Не получил ответ от Voiceflow. Нажми /start ещё раз 🙂', buttons: [] };
+
+    return { text, buttons };
+}
+
 export async function telegramRoutes(app: FastifyInstance) {
     app.post('/api/telegram/webhook', async (req, reply) => {
+        // Telegram важно быстро отдать 200 OK
         reply.send({ ok: true });
 
         const update = UpdateSchema.parse(req.body ?? {});
@@ -85,14 +104,20 @@ export async function telegramRoutes(app: FastifyInstance) {
             const chatId = update.callback_query.message.chat.id;
             const userId = String(update.callback_query.from?.id ?? chatId);
             const payload = update.callback_query.data;
+            const callbackId = update.callback_query.id ?? '';
+
+            // “снять часики” у кнопки
+            await telegramAnswerCallbackQuery(callbackId);
 
             try {
-                // (опционально) “снять часики” у кнопки
-                // если хочешь — добавь callback_query_id в схему и дергай answerCallbackQuery
                 const vf = await voiceflowInteract({ userId, text: payload });
-                await telegramSendMessage(chatId, vf.text, vf.buttons);
+                const out = buildReply(vf);
+                await telegramSendMessage(chatId, out.text, out.buttons);
             } catch (e: any) {
                 app.log.error({ err: e }, 'Telegram callback error');
+                try {
+                    await telegramSendMessage(chatId, 'Упс, ошибка на сервере. Попробуй ещё раз через минуту.');
+                } catch { }
             }
             return;
         }
@@ -107,9 +132,11 @@ export async function telegramRoutes(app: FastifyInstance) {
         if (!text) return;
 
         try {
+            // /start — ОБЯЗАТЕЛЬНО запускаем флоу (launch)
             if (text === '/start') {
                 const vf = await voiceflowInteract({ userId, launch: true });
-                await telegramSendMessage(chatId, vf.text, vf.buttons);
+                const out = buildReply(vf);
+                await telegramSendMessage(chatId, out.text, out.buttons);
                 return;
             }
 
@@ -119,7 +146,8 @@ export async function telegramRoutes(app: FastifyInstance) {
             }
 
             const vf = await voiceflowInteract({ userId, text });
-            await telegramSendMessage(chatId, vf.text, vf.buttons);
+            const out = buildReply(vf);
+            await telegramSendMessage(chatId, out.text, out.buttons);
         } catch (e: any) {
             app.log.error({ err: e }, 'Telegram webhook error');
             try {
