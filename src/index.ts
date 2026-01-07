@@ -32,11 +32,18 @@ async function bootstrap() {
      */
     app.post('/', async (req, reply) => {
         // Перенаправляем на обработчик telegram webhook
+        const payload = JSON.stringify(req.body);
+        
+        // Исключаем content-related заголовки, чтобы избежать несоответствия Content-Length
+        const headers = { ...req.headers };
+        delete headers['content-length'];
+        delete headers['content-type'];
+        
         return app.inject({
             method: 'POST',
             url: '/api/telegram/webhook',
-            payload: JSON.stringify(req.body),
-            headers: req.headers,
+            payload: payload,
+            headers: headers,
         }).then(res => {
             reply.code(res.statusCode).send(res.payload);
         });
