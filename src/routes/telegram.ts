@@ -65,7 +65,7 @@ export async function telegramRoutes(app: FastifyInstance) {
         try {
             // /start — запускаем Voiceflow флоу через launch
             if (text === '/start') {
-                const vf = await voiceflowInteract({ userId, launch: true });
+                const vf = await voiceflowInteract({ userId, text });
 
                 const answer =
                     (vf.text ?? '').trim() ||
