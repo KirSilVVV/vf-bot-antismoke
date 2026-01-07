@@ -1,78 +1,49 @@
 import { env } from '../config/env';
 
+type VFMessage =
+    | { type: 'text'; payload?: { message?: string } }
+    | { type: 'choice'; payload?: { buttons?: Array<{ name?: string; request?: { payload?: string } }> } }
+    | { type: string; payload?: any };
+
 type VoiceflowRuntimeResponseItem = {
     type?: string;
     text?: string;
+    messages?: VFMessage[];
     payload?: any;
-    messages?: Array<{ type: string; payload?: any }>;
 };
 
-function extractTextFromRuntime(items: VoiceflowRuntimeResponseItem[]): string {
-    const texts: string[] = [];
+export type VFButton = {
+    title: string;
+    payload: string; // что отправим обратно в VF при клике
+};
 
-    for (const item of items) {
-        // Иногда runtime кладёт текст прямо в item.text
-        if (typeof item.text === 'string' && item.text.trim()) {
-            texts.push(item.text.trim());
-        }
-
-        // Иногда в item.messages[]
-        if (Array.isArray(item.messages)) {
-            for (const msg of item.messages) {
-                if (msg?.type === 'text') {
-                    const m = msg.payload?.message;
-                    if (typeof m === 'string' && m.trim()) texts.push(m.trim());
-                }
-            }
-        }
-
-        // Иногда текст приходит как item.payload.message (на всякий)
-        const pm = item?.payload?.message;
-        if (typeof pm === 'string' && pm.trim()) {
-            texts.push(pm.trim());
-        }
-    }
-
-    // Уберём дубли строк (частая причина “повторов”)
-    const uniq: string[] = [];
-    const seen = new Set<string>();
-    for (const t of texts) {
-        const key = t.trim();
-        if (!key) continue;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        uniq.push(key);
-    }
-
-    return uniq.join('\n');
-}
+export type VFResult = {
+    text: string;
+    buttons: VFButton[];
+};
 
 export async function voiceflowInteract(params: {
     userId: string;
     text?: string;
     launch?: boolean;
-}): Promise<{ text: string }> {
-    const { userId, text = '', launch = false } = params;
+}): Promise<VFResult> {
+    const { userId, text, launch } = params;
 
-    const url = `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`;
+    const action = launch
+        ? { type: 'launch' as const }
+        : { type: 'text' as const, payload: text ?? '' };
 
-    const body = launch
-        ? { action: { type: 'launch' } }
-        : {
-            action: {
-                type: 'text',
-                payload: text,
+    const res = await fetch(
+        `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`,
+        {
+            method: 'POST',
+            headers: {
+                Authorization: env.VOICEFLOW_API_KEY,
+                'Content-Type': 'application/json',
             },
-        };
-
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-            Authorization: env.VOICEFLOW_API_KEY,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
+            body: JSON.stringify({ action }),
+        }
+    );
 
     if (!res.ok) {
         const errText = await res.text().catch(() => '');
@@ -81,7 +52,39 @@ export async function voiceflowInteract(params: {
 
     const data = (await res.json()) as VoiceflowRuntimeResponseItem[];
 
-    const out = extractTextFromRuntime(data).trim();
+    const texts: string[] = [];
+    const buttons: VFButton[] = [];
 
-    return { text: out || '…' };
+    for (const item of data) {
+        if (item.text) texts.push(item.text);
+
+        const msgs = item.messages ?? [];
+        for (const msg of msgs) {
+            // обычный текст
+            if (msg.type === 'text' && msg.payload?.message) {
+                texts.push(String(msg.payload.message));
+            }
+
+            // кнопки/выбор
+            if (msg.type === 'choice' && Array.isArray(msg.payload?.buttons)) {
+                for (const b of msg.payload!.buttons!) {
+                    const title = (b.name ?? '').trim();
+                    if (!title) continue;
+
+                    // payload: лучше отправлять в VF то, что он ожидает.
+                    // Часто достаточно отправить текст кнопки.
+                    const payload = (b.request?.payload ?? title).trim();
+
+                    buttons.push({ title, payload });
+                }
+            }
+        }
+    }
+
+    const mergedText = texts.map(t => t.trim()).filter(Boolean).join('\n').trim();
+
+    return {
+        text: mergedText || 'Ок 🙂',
+        buttons,
+    };
 }

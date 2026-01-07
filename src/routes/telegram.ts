@@ -1,18 +1,14 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { env } from '../config/env';
-import { voiceflowInteract } from '../services/voiceflowRuntime';
+import { voiceflowInteract, type VFButton } from '../services/voiceflowRuntime';
 
 const UpdateSchema = z
     .object({
-        update_id: z.number().optional(),
         message: z
             .object({
-                message_id: z.number().optional(),
                 text: z.string().optional(),
-                chat: z.object({
-                    id: z.number(),
-                }),
+                chat: z.object({ id: z.number() }),
                 from: z
                     .object({
                         id: z.number(),
@@ -22,13 +18,35 @@ const UpdateSchema = z
                     .optional(),
             })
             .optional(),
-        // Иногда Telegram присылает edited_message — мы его просто игнорируем
-        edited_message: z.any().optional(),
+
+        callback_query: z
+            .object({
+                data: z.string().optional(),
+                message: z
+                    .object({
+                        chat: z.object({ id: z.number() }),
+                    })
+                    .optional(),
+                from: z.object({ id: z.number() }).optional(),
+            })
+            .optional(),
     })
     .passthrough();
 
-async function telegramSendMessage(chatId: number, text: string) {
+async function telegramSendMessage(chatId: number, text: string, buttons?: VFButton[]) {
     const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+    const reply_markup =
+        buttons && buttons.length
+            ? {
+                inline_keyboard: buttons.map((b) => [
+                    {
+                        text: b.title,
+                        callback_data: b.payload.slice(0, 64), // Telegram лимит 64 байта
+                    },
+                ]),
+            }
+            : undefined;
 
     const res = await fetch(url, {
         method: 'POST',
@@ -37,6 +55,7 @@ async function telegramSendMessage(chatId: number, text: string) {
             chat_id: chatId,
             text,
             disable_web_page_preview: true,
+            reply_markup,
         }),
     });
 
@@ -46,89 +65,66 @@ async function telegramSendMessage(chatId: number, text: string) {
     }
 }
 
-// Небольшой анти-дедуп на случай повторных апдейтов (иногда Telegram/прокси/ретраи)
-// Держим в памяти последнее сообщение на чат (достаточно для MVP)
-const lastProcessedByChat = new Map<number, { messageId?: number; text?: string; ts: number }>();
-
-function isDuplicate(chatId: number, messageId?: number, text?: string): boolean {
-    const now = Date.now();
-    const prev = lastProcessedByChat.get(chatId);
-
-    // чистим старьё
-    if (prev && now - prev.ts > 60_000) lastProcessedByChat.delete(chatId);
-
-    if (!prev) {
-        lastProcessedByChat.set(chatId, { messageId, text, ts: now });
-        return false;
-    }
-
-    const sameId = messageId != null && prev.messageId === messageId;
-    const sameText = text != null && prev.text === text;
-
-    if (sameId || sameText) return true;
-
-    lastProcessedByChat.set(chatId, { messageId, text, ts: now });
-    return false;
+async function telegramAnswerCallbackQuery(callbackQueryId: string) {
+    const url = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+    await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callbackQueryId }),
+    }).catch(() => { });
 }
 
-/**
- * Telegram -> наш сервер -> Voiceflow -> Telegram
- */
 export async function telegramRoutes(app: FastifyInstance) {
     app.post('/api/telegram/webhook', async (req, reply) => {
-        // Telegram важно быстро отдать 200 OK
         reply.send({ ok: true });
 
         const update = UpdateSchema.parse(req.body ?? {});
 
-        // Игнорируем edited_message (частая причина дублей)
-        if (update.edited_message) return;
+        // 1) Нажатие на inline-кнопку
+        if (update.callback_query?.data && update.callback_query?.message?.chat?.id) {
+            const chatId = update.callback_query.message.chat.id;
+            const userId = String(update.callback_query.from?.id ?? chatId);
+            const payload = update.callback_query.data;
 
+            try {
+                // (опционально) “снять часики” у кнопки
+                // если хочешь — добавь callback_query_id в схему и дергай answerCallbackQuery
+                const vf = await voiceflowInteract({ userId, text: payload });
+                await telegramSendMessage(chatId, vf.text, vf.buttons);
+            } catch (e: any) {
+                app.log.error({ err: e }, 'Telegram callback error');
+            }
+            return;
+        }
+
+        // 2) Обычное сообщение
         const msg = update.message;
         if (!msg?.chat?.id) return;
 
         const chatId = msg.chat.id;
-        const messageId = msg.message_id;
+        const userId = String(msg.from?.id ?? chatId);
         const text = (msg.text ?? '').trim();
-
-        // отвечаем только на текстовые сообщения
         if (!text) return;
 
-        // анти-дубли
-        if (isDuplicate(chatId, messageId, text)) return;
-
-        const userId = String(msg.from?.id ?? chatId);
-
         try {
-            // /start — запускаем флоу в Voiceflow
             if (text === '/start') {
                 const vf = await voiceflowInteract({ userId, launch: true });
-                const answer = (vf.text ?? '').trim() || 'Привет! Давай начнём 🙂';
-                await telegramSendMessage(chatId, answer);
+                await telegramSendMessage(chatId, vf.text, vf.buttons);
                 return;
             }
 
-            // /help — подсказка (можно тоже отправить в VF, но обычно лучше локально)
             if (text === '/help') {
-                await telegramSendMessage(
-                    chatId,
-                    'Команды:\n/start — начать\n/help — помощь\n\nИли просто пиши текстом — я отвечу.'
-                );
+                await telegramSendMessage(chatId, 'Команды:\n/start — начать\n/help — помощь\n\nИли просто нажимай кнопки 🙂');
                 return;
             }
 
-            // Обычный текст — идём в Voiceflow
             const vf = await voiceflowInteract({ userId, text });
-            const answer = (vf.text ?? '').trim() || 'Ок. Расскажи подробнее, что сейчас происходит?';
-
-            await telegramSendMessage(chatId, answer);
+            await telegramSendMessage(chatId, vf.text, vf.buttons);
         } catch (e: any) {
             app.log.error({ err: e }, 'Telegram webhook error');
             try {
                 await telegramSendMessage(chatId, 'Упс, ошибка на сервере. Попробуй ещё раз через минуту.');
-            } catch {
-                // молча
-            }
+            } catch { }
         }
     });
 }
