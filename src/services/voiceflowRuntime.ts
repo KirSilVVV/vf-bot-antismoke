@@ -1,93 +1,73 @@
 import { env } from '../config/env';
 
-type VoiceflowRuntimeItem = {
+type VFTrace = {
     type?: string;
     text?: string;
     payload?: any;
-    messages?: Array<{ type: string; payload?: any }>;
+    messages?: any[];
 };
 
-type VoiceflowInteractParams =
-    | { userId: string; text: string; launch?: false }
-    | { userId: string; launch: true; text?: string };
-
-function extractTextFromVoiceflow(data: unknown): string {
-    const texts: string[] = [];
-
-    const pushMaybe = (v: any) => {
-        if (typeof v === 'string' && v.trim()) texts.push(v.trim());
-    };
-
-    const scanItem = (item: any) => {
-        if (!item || typeof item !== 'object') return;
-
-        // 1) Иногда бывает item.text
-        pushMaybe(item.text);
-
-        // 2) Иногда бывает массив item.messages
-        if (Array.isArray(item.messages)) {
-            for (const msg of item.messages) {
-                if (!msg) continue;
-                if (msg.type === 'text') {
-                    pushMaybe(msg.payload?.message);
-                    pushMaybe(msg.payload?.text);
-                    pushMaybe(msg.payload); // если payload вдруг строка
-                }
-            }
-        }
-
-        // 3) Иногда это "trace" элементы, где текст лежит в payload.message / payload.text
-        if (item.type === 'text') {
-            pushMaybe(item.payload?.message);
-            pushMaybe(item.payload?.text);
-            pushMaybe(item.payload);
-        }
-
-        // 4) Иногда Voiceflow кладёт message глубже
-        pushMaybe(item.payload?.message);
-        pushMaybe(item.payload?.text);
-    };
-
-    if (Array.isArray(data)) {
-        for (const item of data) scanItem(item);
-    } else if (data && typeof data === 'object') {
-        // На всякий случай, если формат вдруг не массив
-        scanItem(data);
-    }
-
-    return texts.join('\n').trim();
+function normalizeText(s: string) {
+    return (s ?? '').replace(/\r\n/g, '\n').trim();
 }
 
-export async function voiceflowInteract(
-    params: VoiceflowInteractParams
-): Promise<{ text: string; raw: unknown }> {
-    const { userId } = params;
+function pushDedup(arr: string[], value: string) {
+    const v = normalizeText(value);
+    if (!v) return;
 
-    const body =
-        'launch' in params && params.launch
-            ? { action: { type: 'launch' } }
-            : { action: { type: 'text', payload: params.text } };
+    // убираем подряд идущие дубли (самая частая проблема)
+    const last = arr.length ? normalizeText(arr[arr.length - 1]) : '';
+    if (last === v) return;
 
-    const res = await fetch(
-        `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`,
-        {
-            method: 'POST',
-            headers: {
-                Authorization: env.VOICEFLOW_API_KEY,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(body),
-        }
-    );
+    arr.push(v);
+}
+
+export async function voiceflowInteract(params: {
+    userId: string;
+    text: string;
+}): Promise<{ text: string }> {
+    const { userId, text } = params;
+
+    const url = `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`;
+
+    const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+            Authorization: env.VOICEFLOW_API_KEY,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            action: { type: 'text', payload: text },
+        }),
+    });
 
     if (!res.ok) {
         const errText = await res.text().catch(() => '');
         throw new Error(`Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`);
     }
 
-    const data = (await res.json()) as unknown;
+    const data = (await res.json()) as VFTrace[];
 
-    const text = extractTextFromVoiceflow(data) || '…';
+    const texts: string[] = [];
 
-    return { text, raw: data };
+    for (const item of data) {
+        // 1) приоритетно читаем из messages (traces)
+        if (Array.isArray(item.messages)) {
+            for (const msg of item.messages) {
+                // Voiceflow обычно шлёт text именно так
+                if (msg?.type === 'text' && msg?.payload?.message) {
+                    pushDedup(texts, String(msg.payload.message));
+                }
+            }
+        }
+
+        // 2) fallback: если messages нет, а text есть — берём text
+        if ((!item.messages || item.messages.length === 0) && item.text) {
+            pushDedup(texts, String(item.text));
+        }
+    }
+
+    const finalText = texts.join('\n\n').trim() || '…';
+
+    return { text: finalText };
 }
