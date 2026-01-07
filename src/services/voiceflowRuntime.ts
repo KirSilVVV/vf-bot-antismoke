@@ -105,9 +105,30 @@ export async function voiceflowInteract(params: {
     console.log('[VF] Raw data structure:', JSON.stringify(data, null, 2));
 
     for (const item of data) {
+        console.log('[VF] Processing item:', { type: item.type, text: item.text, messagesCount: item.messages?.length });
+        
         // ✅ ВАЖНО: VF часто кладёт текст прямо в item.text
         pushUniqueText(texts, seenTexts, item.text);
 
+        // ✅ Новый формат: текст в item.payload.message (для типов text, speak)
+        if ((item.type === 'text' || item.type === 'speak') && item.payload?.message) {
+            pushUniqueText(texts, seenTexts, item.payload.message);
+        }
+
+        // ✅ Новый формат: кнопки прямо в item.payload.buttons (для типа choice)
+        if (item.type === 'choice' && Array.isArray(item.payload?.buttons)) {
+            for (const b of item.payload.buttons) {
+                const title = (b.name ?? '').trim();
+                if (!title) continue;
+
+                const payloadRaw = b.request?.payload;
+                const payload = payloadToString(payloadRaw, title).trim() || title;
+
+                buttons.push({ title, payload });
+            }
+        }
+
+        // ✅ Старый формат: текст в item.messages[] (обратная совместимость)
         const msgs = item.messages ?? [];
         for (const msg of msgs) {
             // ✅ текстовые сообщения VF могут быть text или speak
