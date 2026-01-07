@@ -189,7 +189,7 @@ export async function telegramRoutes(app: FastifyInstance) {
 
             const tokenOrPayload = update.callback_query.data;
             const payload = getCallbackPayload(tokenOrPayload); // <-- вот это обычно и чинит "Sorry, I didn’t get that"
-
+            app.log.info({ tokenOrPayload, payload }, '[CALLBACK] Button clicked');
             try {
                 const vf = await voiceflowInteract({ userId, text: payload });
                 const out = buildReply(vf);
