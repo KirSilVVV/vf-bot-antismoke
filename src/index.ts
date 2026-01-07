@@ -34,10 +34,10 @@ async function bootstrap() {
         // Перенаправляем на обработчик telegram webhook
         const payload = JSON.stringify(req.body);
         
-        // Исключаем content-related заголовки, чтобы избежать несоответствия Content-Length
+        // Исключаем content-length, но сохраняем/устанавливаем content-type как JSON
         const headers = { ...req.headers };
         delete headers['content-length'];
-        delete headers['content-type'];
+        headers['content-type'] = 'application/json';
         
         return app.inject({
             method: 'POST',
