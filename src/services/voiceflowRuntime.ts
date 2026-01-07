@@ -70,24 +70,33 @@ export async function voiceflowInteract(params: {
         ? ({ type: 'launch' } as const)
         : ({ type: 'text', payload: text ?? '' } as const);
 
-    const res = await fetch(
-        `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`,
-        {
-            method: 'POST',
-            headers: {
-                Authorization: env.VOICEFLOW_API_KEY,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ action }),
-        }
-    );
+    const vfUrl = `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`;
+    
+    console.log('[VF] Request:', { 
+        url: vfUrl, 
+        action, 
+        hasApiKey: !!env.VOICEFLOW_API_KEY,
+        versionId: env.VOICEFLOW_VERSION_ID 
+    });
+
+    const res = await fetch(vfUrl, {
+        method: 'POST',
+        headers: {
+            Authorization: env.VOICEFLOW_API_KEY,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action }),
+    });
 
     if (!res.ok) {
         const errText = await res.text().catch(() => '');
-        throw new Error(`Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`);
+        const error = `Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`;
+        console.error('[VF] Error:', error);
+        throw new Error(error);
     }
 
     const data = (await res.json()) as VoiceflowRuntimeResponseItem[];
+    console.log('[VF] Response:', { itemCount: data.length, data });
 
     const texts: string[] = [];
     const seenTexts = new Set<string>();
@@ -121,15 +130,25 @@ export async function voiceflowInteract(params: {
 
     const mergedText = texts.join('\n\n').trim();
 
+    console.log('[VF] Parsed result:', { 
+        textCount: texts.length, 
+        mergedText: mergedText.substring(0, 100), 
+        buttonCount: buttons.length 
+    });
+
     // Если текста нет, но есть кнопки — подскажем пользователю
     if (!mergedText && buttons.length) {
         return { text: 'Выбери вариант:', buttons };
     }
 
     // Если нет вообще ничего — значит VF прислал не то, что мы ожидаем (или flow пустой на launch)
-    // Но вместо "…" лучше явно показать проблему (и чтобы ты увидел, что это не "сломалось", а пусто).
     if (!mergedText && !buttons.length) {
-        return { text: '…', buttons: [] };
+        console.warn('[VF] WARNING: Empty response from Voiceflow. Check:');
+        console.warn('  1. VOICEFLOW_VERSION_ID is correct and published');
+        console.warn('  2. VOICEFLOW_API_KEY is valid');
+        console.warn('  3. The flow has a launch state / entrypoint');
+        console.warn('  4. Voiceflow API is accessible');
+        return { text: '❌ Воiceflow вернул пусто. Проверьте конфигурацию (API key, version ID).', buttons: [] };
     }
 
     return {
