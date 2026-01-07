@@ -102,6 +102,8 @@ export async function voiceflowInteract(params: {
     const seenTexts = new Set<string>();
     const buttons: VFButton[] = [];
 
+    console.log('[VF] Raw data structure:', JSON.stringify(data, null, 2));
+
     for (const item of data) {
         // ✅ ВАЖНО: VF часто кладёт текст прямо в item.text
         pushUniqueText(texts, seenTexts, item.text);
