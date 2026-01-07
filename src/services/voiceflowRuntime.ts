@@ -1,149 +1,151 @@
+// src/services/voiceflowRuntime.ts
 import { env } from '../config/env';
 
-type AnyObj = Record<string, any>;
+type VFMessage =
+  | { type: 'text'; payload?: { message?: string } }
+  | { type: 'choice'; payload?: { buttons?: Array<{ name?: string; request?: { payload?: string } }> } }
+  | { type: 'buttons'; payload?: { buttons?: Array<{ name?: string; request?: { payload?: string } }> } }
+  | { type: string; payload?: any };
+
+type VoiceflowRuntimeResponseItem = {
+  type?: string;
+  text?: string; // часто дублирует messages — поэтому ниже мы в основном читаем messages
+  messages?: VFMessage[];
+  payload?: any;
+};
 
 export type VFButton = {
-    title: string;
-    payload: string;
+  title: string;
+  payload: string; // то, что отправим обратно в VF при клике
 };
 
 export type VFResult = {
-    text: string;          // может быть пустым, это нормально
-    buttons: VFButton[];
+  text: string;
+  buttons: VFButton[];
 };
 
-function pickTextFromPayload(payload: any): string[] {
-    const out: string[] = [];
-    if (!payload) return out;
-
-    // 1) самый частый кейс
-    if (typeof payload.message === 'string' && payload.message.trim()) {
-        out.push(payload.message.trim());
-    }
-
-    // 2) иногда бывает просто payload.text
-    if (typeof payload.text === 'string' && payload.text.trim()) {
-        out.push(payload.text.trim());
-    }
-
-    // 3) иногда Voiceflow отдаёт slate/blocks (структурированно)
-    // Тут мы не делаем “красивый рендер”, но хотя бы достанем видимый текст
-    // из типичных полей.
-    const slate = payload.slate ?? payload.richText ?? payload.blocks;
-    if (slate) {
-        try {
-            const str = JSON.stringify(slate);
-            // очень грубо: вытащим куски "text":"..."
-            const matches = [...str.matchAll(/"text"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
-            for (const t of matches) {
-                const cleaned = t.replace(/\\n/g, '\n').trim();
-                if (cleaned) out.push(cleaned);
-            }
-        } catch {
-            // ignore
-        }
-    }
-
-    return out;
+// ---- helpers ----
+function normalizeText(s: string) {
+  return s.replace(/\r\n/g, '\n').trim();
 }
 
-function pickButtonsFromChoicePayload(payload: any): VFButton[] {
-    const buttons: VFButton[] = [];
-    if (!payload) return buttons;
+function pushUniqueText(out: string[], seen: Set<string>, value: string) {
+  const t = normalizeText(value);
+  if (!t) return;
 
-    const rawButtons =
-        payload.buttons ??
-        payload.choices ??
-        payload.options;
+  // ключ для дедупа: сжимаем пробелы/табы
+  const key = t.replace(/[ \t]+/g, ' ');
+  if (seen.has(key)) return;
 
-    if (!Array.isArray(rawButtons)) return buttons;
-
-    for (const b of rawButtons) {
-        const title =
-            String(b?.name ?? b?.label ?? b?.text ?? '').trim();
-
-        if (!title) continue;
-
-        const vfPayload =
-            String(b?.request?.payload ?? b?.payload ?? title).trim();
-
-        buttons.push({ title, payload: vfPayload });
-    }
-
-    return buttons;
+  seen.add(key);
+  out.push(t);
 }
 
-export async function voiceflowInteract(params: {
-    userId: string;
-    text?: string;
-    launch?: boolean;
-}): Promise<VFResult> {
-    const { userId, text, launch } = params;
+function pushButton(out: VFButton[], titleRaw: unknown, payloadRaw: unknown) {
+  const title = String(titleRaw ?? '').trim();
+  if (!title) return;
 
-    const action = launch
-        ? { type: 'launch' as const }
-        : { type: 'text' as const, payload: text ?? '' };
-
-    const res = await fetch(
-        `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`,
-        {
-            method: 'POST',
-            headers: {
-                Authorization: env.VOICEFLOW_API_KEY,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ action }),
-        }
-    );
-
-    if (!res.ok) {
-        const errText = await res.text().catch(() => '');
-        throw new Error(
-            `Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`
-        );
-    }
-
-    const data = (await res.json()) as AnyObj[];
-
-    const texts: string[] = [];
-    const buttons: VFButton[] = [];
-
-    for (const item of data) {
-        // A) иногда текст лежит в item.text
-        if (typeof item?.text === 'string' && item.text.trim()) {
-            texts.push(item.text.trim());
-        }
-
-        // B) часто текст лежит в item.payload
-        if (item?.payload) {
-            texts.push(...pickTextFromPayload(item.payload));
-            buttons.push(...pickButtonsFromChoicePayload(item.payload));
-        }
-
-        // C) иногда в item.messages[]
-        const msgs = Array.isArray(item?.messages) ? item.messages : [];
-        for (const msg of msgs) {
-            if (msg?.payload) {
-                texts.push(...pickTextFromPayload(msg.payload));
-                buttons.push(...pickButtonsFromChoicePayload(msg.payload));
-            }
-
-            // некоторые типы могут быть без payload.message, но с msg.text
-            if (typeof msg?.text === 'string' && msg.text.trim()) {
-                texts.push(msg.text.trim());
-            }
-        }
-    }
-
-    const mergedText = texts
-        .map((t) => t.trim())
-        .filter(Boolean)
-        .join('\n')
-        .trim();
-
-    // ВАЖНО: никаких "Ок 🙂" по умолчанию — пусть телеграм-слой решает, что делать
-    return {
-        text: mergedText,
-        buttons,
-    };
+  const payload = String(payloadRaw ?? '').trim() || title;
+  out.push({ title, payload });
 }
+
+type VFAction =
+  | { type: 'launch' }
+  | { type: 'text'; payload: string }
+  | { type: string; payload?: any };
+
+// ---- main ----
+export async function voiceflowInteract(
+  params:
+    | { userId: string; launch: true }
+    | { userId: string; action: VFAction }
+    | { userId: string; text: string }
+): Promise<VFResult> {
+  const userId = (params as any).userId as string;
+
+  let action: VFAction;
+
+  // ✅ ВАЖНО: корректное сужение union-типа (иначе TS ругается на params.text)
+  if ('launch' in params && params.launch) {
+    action = { type: 'launch' };
+  } else if ('action' in params) {
+    action = params.action;
+  } else if ('text' in params) {
+    action = { type: 'text', payload: params.text };
+  } else {
+    throw new Error('Invalid voiceflowInteract params');
+  }
+
+  const res = await fetch(
+    `https://general-runtime.voiceflow.com/state/${env.VOICEFLOW_VERSION_ID}/user/${userId}/interact`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: env.VOICEFLOW_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ action }),
+    }
+  );
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Voiceflow runtime error: ${res.status} ${res.statusText} - ${errText}`);
+  }
+
+  const data = (await res.json()) as VoiceflowRuntimeResponseItem[];
+
+  const texts: string[] = [];
+  const seenTexts = new Set<string>();
+  const buttons: VFButton[] = [];
+
+  for (const item of data) {
+    const msgs = item.messages ?? [];
+
+    // Берём текст в приоритете из messages, потому что item.text часто дублит
+    for (const msg of msgs) {
+      // 1) текстовые сообщения
+      if (msg.type === 'text' && msg.payload?.message) {
+        pushUniqueText(texts, seenTexts, String(msg.payload.message));
+      }
+
+      // 2) выбор/кнопки (choice)
+      if (msg.type === 'choice' && Array.isArray(msg.payload?.buttons)) {
+        for (const b of msg.payload!.buttons!) {
+          const title = (b.name ?? '').trim();
+          if (!title) continue;
+
+          // Что отправлять обратно в VF при клике:
+          // чаще всего VF ожидает request.payload, если он задан;
+          // иначе можно отправить title
+          const payload = (b.request?.payload ?? title).trim();
+          pushButton(buttons, title, payload);
+        }
+      }
+
+      // 3) buttons (некоторые проекты/блоки VF отдают именно так)
+      if (msg.type === 'buttons' && Array.isArray((msg as any).payload?.buttons)) {
+        const arr = (msg as any).payload.buttons as Array<{ name?: string; request?: { payload?: string } }>;
+        for (const b of arr) {
+          const title = (b.name ?? '').trim();
+          if (!title) continue;
+          const payload = (b.request?.payload ?? title).trim();
+          pushButton(buttons, title, payload);
+        }
+      }
+    }
+
+    // Если вдруг VF не положил текст в messages, можно подстраховаться item.text
+    if (item.text) {
+      pushUniqueText(texts, seenTexts, String(item.text));
+    }
+  }
+
+  const mergedText = texts.join('\n\n').trim();
+
+  return {
+    text: mergedText || (buttons.length ? 'Выбери вариант:' : '…'),
+    buttons,
+  };
+}
+ 
