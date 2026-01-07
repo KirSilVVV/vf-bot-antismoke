@@ -28,6 +28,21 @@ async function bootstrap() {
     });
 
     /**
+     * POST / — Telegram webhook (может отправлять на корневой URL)
+     */
+    app.post('/', async (req, reply) => {
+        // Перенаправляем на обработчик telegram webhook
+        return app.inject({
+            method: 'POST',
+            url: '/api/telegram/webhook',
+            payload: JSON.stringify(req.body),
+            headers: req.headers,
+        }).then(res => {
+            reply.code(res.statusCode).send(res.payload);
+        });
+    });
+
+    /**
      * API routes
      */
     app.register(healthRoutes);

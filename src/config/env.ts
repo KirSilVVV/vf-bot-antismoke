@@ -14,8 +14,8 @@ const EnvSchema = z.object({
     VOICEFLOW_API_KEY: z.string().min(1),
     VOICEFLOW_VERSION_ID: z.string().optional(),
 
-    // Voiceflow webhook secret (Voiceflow -> сервер) — у тебя уже есть проверка
-    VOICEFLOW_WEBHOOK_SECRET: z.string().min(1),
+    // Voiceflow webhook secret (Voiceflow -> сервер) — опциональна для webhook режима
+    VOICEFLOW_WEBHOOK_SECRET: z.string().optional().default(''),
 
     // Optional (если потом будешь звать OpenAI напрямую)
     OPENAI_API_KEY: z.string().optional(),
