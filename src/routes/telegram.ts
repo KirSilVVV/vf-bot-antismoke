@@ -155,6 +155,17 @@ async function telegramAnswerCallbackQuery(callbackQueryId?: string) {
     }
 }
 
+async function telegramSendChatAction(chatId: number, action: string = 'typing') {
+    try {
+        await telegramApi('sendChatAction', {
+            chat_id: chatId,
+            action: action,
+        });
+    } catch {
+        // игнорим — это только UX
+    }
+}
+
 function buildReply(vf: { text?: string; buttons?: VFButton[] }) {
     const text = (vf.text ?? '').trim();
     const buttons = Array.isArray(vf.buttons) ? vf.buttons : [];
@@ -210,6 +221,7 @@ export async function telegramRoutes(app: FastifyInstance) {
 
             try {
                 // Отправляем action вместо text
+                await telegramSendChatAction(chatId);
                 const vf = await voiceflowInteract({ userId, action });
                 const out = buildReply(vf);
                 await telegramSendMessage(chatId, out.text, out.buttons);
@@ -239,6 +251,7 @@ export async function telegramRoutes(app: FastifyInstance) {
         try {
             // /start — запускаем флоу (как ты хотел)
             if (text === '/start') {
+                await telegramSendChatAction(chatId);
                 const vf = await voiceflowInteract({ userId, launch: true });
                 const out = buildReply(vf);
                 await telegramSendMessage(chatId, out.text, out.buttons);
@@ -250,6 +263,7 @@ export async function telegramRoutes(app: FastifyInstance) {
                 return;
             }
 
+            await telegramSendChatAction(chatId);
             const vf = await voiceflowInteract({ userId, text });
             const out = buildReply(vf);
             await telegramSendMessage(chatId, out.text, out.buttons);
