@@ -1,7 +1,6 @@
 import Fastify from 'fastify';
 import { env } from './config/env';
 import { healthRoutes } from './routes/health';
-import { voiceflowRoutes } from './routes/voiceflow';
 import { telegramRoutes } from './routes/telegram';
 
 async function bootstrap() {
@@ -53,7 +52,6 @@ async function bootstrap() {
      * API routes
      */
     app.register(healthRoutes);
-    app.register(voiceflowRoutes);
     app.register(telegramRoutes);
 
     /**

@@ -2,7 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { env } from '../config/env';
-import { voiceflowInteract, type VFButton } from '../services/voiceflowRuntime';
+import { chatWithAI, clearSession, getApiStats } from '../services/openaiService';
 
 /**
  * Telegram Update schema (message + callback_query)
@@ -28,8 +28,8 @@ const UpdateSchema = z
 
         callback_query: z
             .object({
-                id: z.string().optional(), // callback_query_id
-                data: z.string().optional(), // callback_data
+                id: z.string().optional(),
+                data: z.string().optional(),
                 message: z
                     .object({
                         message_id: z.number().optional(),
@@ -44,7 +44,6 @@ const UpdateSchema = z
 
 /**
  * Anti-replay cache (in-memory)
- * Храним ключи 5 минут, чтобы не обрабатывать один и тот же апдейт/сообщение/клик повторно.
  */
 const seen = new Map<string, number>();
 const SEEN_TTL_MS = 5 * 60 * 1000;
@@ -52,7 +51,6 @@ const SEEN_TTL_MS = 5 * 60 * 1000;
 function markSeen(key: string) {
     const now = Date.now();
 
-    // лёгкая уборка иногда
     if (seen.size > 5000) {
         for (const [k, ts] of seen) {
             if (now - ts > SEEN_TTL_MS) seen.delete(k);
@@ -64,42 +62,6 @@ function markSeen(key: string) {
 
     seen.set(key, now);
     return true;
-}
-
-/**
- * Callback payload store:
- * Telegram callback_data ограничен 64 байтами.
- * Если VF отдаёт длинный payload (часто так и бывает), мы кладём его в Map и в callback_data шлём короткий token.
- */
-const cbStore = new Map<string, { payload: string; exp: number }>();
-const CB_TTL_MS = 10 * 60 * 1000;
-
-function makeToken() {
-    // достаточно короткий токен под Telegram 64 bytes
-    return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function putCallbackPayload(payload: string) {
-    const token = makeToken();
-    cbStore.set(token, { payload, exp: Date.now() + CB_TTL_MS });
-
-    // периодическая уборка
-    if (cbStore.size > 5000) {
-        const now = Date.now();
-        for (const [k, v] of cbStore) if (v.exp < now) cbStore.delete(k);
-    }
-
-    return token;
-}
-
-function getCallbackPayload(tokenOrPayload: string) {
-    const v = cbStore.get(tokenOrPayload);
-    if (!v) return tokenOrPayload; // если это не токен — значит там уже payload (или токен истёк)
-    if (v.exp < Date.now()) {
-        cbStore.delete(tokenOrPayload);
-        return tokenOrPayload;
-    }
-    return v.payload;
 }
 
 async function telegramApi(method: string, body: any) {
@@ -114,45 +76,18 @@ async function telegramApi(method: string, body: any) {
         const t = await res.text().catch(() => '');
         throw new Error(`Telegram API ${method} failed: ${res.status} ${res.statusText} - ${t}`);
     }
+
+    return res.json();
 }
 
-async function telegramSendMessage(chatId: number, text: string, buttons?: VFButton[]) {
+async function telegramSendMessage(chatId: number, text: string) {
     const safeText = (text ?? '').toString().trim() || '…';
-
-    const reply_markup =
-        buttons && buttons.length
-            ? {
-                inline_keyboard: buttons.map((b) => {
-                    // если payload длинный — превращаем в token
-                    const payload = String(b.payload ?? '').trim() || String(b.title ?? '').trim();
-                    const callback_data =
-                        Buffer.byteLength(payload, 'utf8') <= 60 ? payload : putCallbackPayload(payload);
-
-                    return [
-                        {
-                            text: b.title,
-                            callback_data,
-                        },
-                    ];
-                }),
-            }
-            : undefined;
 
     await telegramApi('sendMessage', {
         chat_id: chatId,
         text: safeText,
         disable_web_page_preview: true,
-        reply_markup,
     });
-}
-
-async function telegramAnswerCallbackQuery(callbackQueryId?: string) {
-    if (!callbackQueryId) return;
-    try {
-        await telegramApi('answerCallbackQuery', { callback_query_id: callbackQueryId });
-    } catch {
-        // игнорим — это только UX, на логику не влияет
-    }
 }
 
 async function telegramSendChatAction(chatId: number, action: string = 'typing') {
@@ -166,75 +101,53 @@ async function telegramSendChatAction(chatId: number, action: string = 'typing')
     }
 }
 
-function buildReply(vf: { text?: string; buttons?: VFButton[] }) {
-    const text = (vf.text ?? '').trim();
-    const buttons = Array.isArray(vf.buttons) ? vf.buttons : [];
-    if (!text && buttons.length) return { text: 'Выбери вариант:', buttons };
-    if (!text && !buttons.length) return { text: '…', buttons: [] };
-    return { text, buttons };
+/**
+ * Send alert to admin about API usage
+ */
+async function sendAdminAlert(message: string) {
+    if (!env.ADMIN_CHAT_ID) return;
+
+    try {
+        await telegramApi('sendMessage', {
+            chat_id: env.ADMIN_CHAT_ID,
+            text: message,
+            parse_mode: 'HTML',
+        });
+    } catch (error) {
+        console.error('[Admin Alert] Failed to send:', error);
+    }
+}
+
+/**
+ * Check API usage and send alert if needed
+ */
+async function checkAndAlertApiUsage(tokensUsed: number) {
+    const stats = getApiStats();
+
+    // Алерт каждые 1000 запросов
+    if (stats.apiCallsCount % 100 === 0) {
+        await sendAdminAlert(
+            `📊 <b>Статистика API (antismoke)</b>\n\n` +
+            `Запросов: <b>${stats.apiCallsCount}</b>\n` +
+            `Токенов использовано: <b>${stats.totalTokensUsed.toLocaleString()}</b>\n` +
+            `Последний запрос: ${tokensUsed} токенов`
+        );
+    }
 }
 
 export async function telegramRoutes(app: FastifyInstance) {
     app.post('/api/telegram/webhook', async (req, reply) => {
-        // Важно: ответить Telegram сразу, иначе он ретраит вебхук и получаются дубли
+        // Ответить Telegram сразу
         reply.send({ ok: true });
 
         const update = UpdateSchema.parse(req.body ?? {});
 
-        // 0) Anti-replay на update_id (главный предохранитель от повторов)
+        // Anti-replay на update_id
         if (typeof update.update_id === 'number') {
             if (!markSeen(`u:${update.update_id}`)) return;
         }
 
-        // 1) Нажатие на inline-кнопку
-        if (update.callback_query?.data && update.callback_query?.message?.chat?.id) {
-            const chatId = update.callback_query.message.chat.id;
-            const userId = String(update.callback_query.from?.id ?? chatId);
-            const callbackId = update.callback_query.id;
-
-            // отдельный anti-replay на callback id
-            if (callbackId && !markSeen(`c:${callbackId}`)) return;
-
-            // “снять часики” у Telegram кнопки
-            await telegramAnswerCallbackQuery(callbackId);
-
-            const tokenOrPayload = update.callback_query.data;
-            const payload = getCallbackPayload(tokenOrPayload); // <-- вот это обычно и чинит "Sorry, I didn’t get that"
-            app.log.info({ tokenOrPayload, payload }, '[CALLBACK] Button clicked');
-
-            // ✅ Парсим payload как JSON (может быть весь request объект)
-            let action: any = { type: 'text', payload };
-            try {
-                const parsed = JSON.parse(payload);
-                if (parsed.type && parsed.payload) {
-                    // Это полный request объект от Voiceflow
-                    action = parsed;
-                    app.log.info({ action }, '[CALLBACK] Parsed request action');
-                } else {
-                    // Это просто текст или старый формат
-                    action = { type: 'text', payload: payload };
-                }
-            } catch {
-                // Если не JSON — это просто текст
-                action = { type: 'text', payload };
-            }
-
-            try {
-                // Отправляем action вместо text
-                await telegramSendChatAction(chatId);
-                const vf = await voiceflowInteract({ userId, action });
-                const out = buildReply(vf);
-                await telegramSendMessage(chatId, out.text, out.buttons);
-            } catch (e: any) {
-                app.log.error({ err: e }, 'Telegram callback error');
-                try {
-                    await telegramSendMessage(chatId, 'Упс, ошибка на сервере. Попробуй ещё раз через минуту.');
-                } catch { }
-            }
-            return;
-        }
-
-        // 2) Обычное сообщение
+        // Обычное сообщение
         const msg = update.message;
         if (!msg?.chat?.id) return;
 
@@ -243,32 +156,68 @@ export async function telegramRoutes(app: FastifyInstance) {
         const text = (msg.text ?? '').trim();
         if (!text) return;
 
-        // anti-replay на message_id (доп. страховка)
+        // anti-replay на message_id
         if (typeof msg.message_id === 'number') {
             if (!markSeen(`m:${chatId}:${msg.message_id}`)) return;
         }
 
         try {
-            // /start — запускаем флоу (как ты хотел)
+            // /start — приветствие
             if (text === '/start') {
+                clearSession(userId);
                 await telegramSendChatAction(chatId);
-                const vf = await voiceflowInteract({ userId, launch: true });
-                const out = buildReply(vf);
-                await telegramSendMessage(chatId, out.text, out.buttons);
+                const result = await chatWithAI(userId, 'Привет! Я хочу бросить курить.', true);
+                await telegramSendMessage(chatId, result.text);
+                await checkAndAlertApiUsage(result.tokensUsed);
                 return;
             }
 
+            // /help — справка
             if (text === '/help') {
-                await telegramSendMessage(chatId, 'Команды:\n/start — начать\n/help — помощь\n\nИли просто нажимай кнопки 🙂');
+                await telegramSendMessage(
+                    chatId,
+                    '🚭 <b>Бот-коуч по отказу от курения</b>\n\n' +
+                    'Я помогу тебе:\n' +
+                    '• Составить план отказа от сигарет\n' +
+                    '• Справиться с тягой к курению\n' +
+                    '• Не сорваться в сложные моменты\n' +
+                    '• Отслеживать прогресс\n\n' +
+                    'Просто пиши мне о своих ощущениях, задавай вопросы или проси совета.\n\n' +
+                    '<b>Команды:</b>\n' +
+                    '/start — начать сначала\n' +
+                    '/help — эта справка'
+                );
                 return;
             }
 
+            // /stats — статистика API (только для админа)
+            if (text === '/stats' && env.ADMIN_CHAT_ID && String(chatId) === env.ADMIN_CHAT_ID) {
+                const stats = getApiStats();
+                await telegramSendMessage(
+                    chatId,
+                    `📊 <b>Статистика API</b>\n\n` +
+                    `Запросов: ${stats.apiCallsCount}\n` +
+                    `Токенов: ${stats.totalTokensUsed.toLocaleString()}`
+                );
+                return;
+            }
+
+            // Обычное сообщение — передать в OpenAI
             await telegramSendChatAction(chatId);
-            const vf = await voiceflowInteract({ userId, text });
-            const out = buildReply(vf);
-            await telegramSendMessage(chatId, out.text, out.buttons);
+            const result = await chatWithAI(userId, text);
+            await telegramSendMessage(chatId, result.text);
+            await checkAndAlertApiUsage(result.tokensUsed);
+
         } catch (e: any) {
             app.log.error({ err: e }, 'Telegram webhook error');
+
+            // Отправить алерт админу об ошибке
+            await sendAdminAlert(
+                `❌ <b>Ошибка в боте antismoke</b>\n\n` +
+                `User: ${userId}\n` +
+                `Error: ${e.message}`
+            );
+
             try {
                 await telegramSendMessage(chatId, 'Упс, ошибка на сервере. Попробуй ещё раз через минуту.');
             } catch { }

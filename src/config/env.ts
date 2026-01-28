@@ -10,15 +10,11 @@ const EnvSchema = z.object({
     // Telegram
     TELEGRAM_BOT_TOKEN: z.string().min(1, 'TELEGRAM_BOT_TOKEN is required'),
 
-    // Voiceflow Runtime (сервер -> Voiceflow)
-    VOICEFLOW_API_KEY: z.string().min(1, 'VOICEFLOW_API_KEY is required'),
-    VOICEFLOW_VERSION_ID: z.string().optional(),
+    // OpenAI
+    OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
 
-    // Voiceflow webhook secret (Voiceflow -> сервер) — опциональна для webhook режима
-    VOICEFLOW_WEBHOOK_SECRET: z.string().optional().default(''),
-
-    // Optional (если потом будешь звать OpenAI напрямую)
-    OPENAI_API_KEY: z.string().optional(),
+    // Admin alerts
+    ADMIN_CHAT_ID: z.string().optional(),
 });
 
 try {
