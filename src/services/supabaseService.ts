@@ -6,24 +6,25 @@ const supabase = createClient(env.SUPABASE_URL, env.SUPABASE_KEY);
 
 // Pricing configuration
 export const PRICING = {
-    FREE_MESSAGES: 5,
-    PACKAGES: [
-        { id: 'start', messages: 10, stars: 25, label: '10 сообщений' },
-        { id: 'optimum', messages: 50, stars: 100, label: '50 сообщений' },
-        { id: 'maximum', messages: 200, stars: 350, label: '200 сообщений' },
-    ],
+    FREE_DAILY_LIMIT: 5,
+    PREMIUM_PRICE_STARS: 99,
+    PREMIUM_DURATION_DAYS: 30,
 } as const;
 
 export type UserData = {
     telegram_id: string;
     username: string | null;
     first_name: string | null;
-    messages_remaining: number;
-    total_messages_bought: number;
+    is_premium: boolean;
+    premium_until: string | null;
+    daily_messages_used: number;
+    last_message_date: string;
+    total_messages: number;
     total_stars_spent: number;
     quit_date: string | null;
     cigarettes_per_day: number | null;
     pack_price: number | null;
+    smoke_free_days: number;
     created_at: string;
     updated_at: string;
 };
@@ -36,7 +37,6 @@ export async function getOrCreateUser(
     username?: string,
     firstName?: string
 ): Promise<UserData> {
-    // Try to get existing user
     const { data: existing } = await supabase
         .from('antismoke_users')
         .select('*')
@@ -47,16 +47,12 @@ export async function getOrCreateUser(
         return existing as UserData;
     }
 
-    // Create new user with free messages
     const { data: newUser, error } = await supabase
         .from('antismoke_users')
         .insert({
             telegram_id: telegramId,
             username: username || null,
             first_name: firstName || null,
-            messages_remaining: PRICING.FREE_MESSAGES,
-            total_messages_bought: 0,
-            total_stars_spent: 0,
         })
         .select()
         .single();
@@ -70,126 +66,206 @@ export async function getOrCreateUser(
 }
 
 /**
- * Check if user has messages remaining
+ * Check if user has active premium subscription
  */
-export async function hasMessagesRemaining(telegramId: string): Promise<boolean> {
-    const user = await getOrCreateUser(telegramId);
-    return user.messages_remaining > 0;
+export function isPremiumActive(user: UserData): boolean {
+    if (!user.is_premium || !user.premium_until) return false;
+    return new Date(user.premium_until) > new Date();
 }
 
 /**
- * Get remaining messages count
+ * Get today's date string in YYYY-MM-DD format
  */
-export async function getMessagesRemaining(telegramId: string): Promise<number> {
-    const user = await getOrCreateUser(telegramId);
-    return user.messages_remaining;
+function getTodayString(): string {
+    return new Date().toISOString().split('T')[0];
 }
 
 /**
- * Consume one message credit
+ * Check if user can send message (has premium or daily limit not reached)
  */
-export async function consumeMessage(telegramId: string): Promise<number> {
-    const { data, error } = await supabase
-        .from('antismoke_users')
-        .update({
-            messages_remaining: supabase.rpc('decrement_messages', { user_id: telegramId }),
-            updated_at: new Date().toISOString(),
-        })
-        .eq('telegram_id', telegramId)
-        .select('messages_remaining')
-        .single();
+export async function canSendMessage(telegramId: string): Promise<{
+    canSend: boolean;
+    isPremium: boolean;
+    messagesUsedToday: number;
+    dailyLimit: number;
+}> {
+    const user = await getOrCreateUser(telegramId);
+    const today = getTodayString();
 
-    // Fallback: manual decrement
-    if (error) {
-        const user = await getOrCreateUser(telegramId);
-        const newCount = Math.max(0, user.messages_remaining - 1);
-
+    // Reset daily counter if new day
+    if (user.last_message_date !== today) {
         await supabase
             .from('antismoke_users')
             .update({
-                messages_remaining: newCount,
-                updated_at: new Date().toISOString(),
+                daily_messages_used: 0,
+                last_message_date: today,
             })
             .eq('telegram_id', telegramId);
 
-        return newCount;
+        user.daily_messages_used = 0;
     }
 
-    return data?.messages_remaining ?? 0;
+    const isPremium = isPremiumActive(user);
+
+    return {
+        canSend: isPremium || user.daily_messages_used < PRICING.FREE_DAILY_LIMIT,
+        isPremium,
+        messagesUsedToday: user.daily_messages_used,
+        dailyLimit: PRICING.FREE_DAILY_LIMIT,
+    };
 }
 
 /**
- * Add messages after payment
+ * Record message sent
  */
-export async function addMessages(
-    telegramId: string,
-    messagesCount: number,
-    starsSpent: number
-): Promise<number> {
+export async function recordMessage(telegramId: string): Promise<{
+    messagesUsedToday: number;
+    remainingToday: number;
+    isPremium: boolean;
+}> {
     const user = await getOrCreateUser(telegramId);
-    const newMessagesRemaining = user.messages_remaining + messagesCount;
+    const today = getTodayString();
+    const isPremium = isPremiumActive(user);
 
-    const { error } = await supabase
+    // Reset if new day
+    const newDailyCount = user.last_message_date === today
+        ? user.daily_messages_used + 1
+        : 1;
+
+    await supabase
         .from('antismoke_users')
         .update({
-            messages_remaining: newMessagesRemaining,
-            total_messages_bought: user.total_messages_bought + messagesCount,
+            daily_messages_used: newDailyCount,
+            last_message_date: today,
+            total_messages: user.total_messages + 1,
+            updated_at: new Date().toISOString(),
+        })
+        .eq('telegram_id', telegramId);
+
+    return {
+        messagesUsedToday: newDailyCount,
+        remainingToday: Math.max(0, PRICING.FREE_DAILY_LIMIT - newDailyCount),
+        isPremium,
+    };
+}
+
+/**
+ * Activate premium subscription
+ */
+export async function activatePremium(
+    telegramId: string,
+    starsSpent: number
+): Promise<{ premiumUntil: Date }> {
+    const user = await getOrCreateUser(telegramId);
+
+    // If already premium, extend from current end date
+    const startDate = isPremiumActive(user) && user.premium_until
+        ? new Date(user.premium_until)
+        : new Date();
+
+    const premiumUntil = new Date(startDate);
+    premiumUntil.setDate(premiumUntil.getDate() + PRICING.PREMIUM_DURATION_DAYS);
+
+    await supabase
+        .from('antismoke_users')
+        .update({
+            is_premium: true,
+            premium_until: premiumUntil.toISOString(),
             total_stars_spent: user.total_stars_spent + starsSpent,
             updated_at: new Date().toISOString(),
         })
         .eq('telegram_id', telegramId);
 
-    if (error) {
-        console.error('[Supabase] Error adding messages:', error);
-        throw error;
-    }
-
-    return newMessagesRemaining;
+    return { premiumUntil };
 }
 
 /**
- * Update user's quit data
+ * Update quit smoking data
  */
-export async function updateQuitData(
+export async function setQuitDate(
     telegramId: string,
-    data: {
-        quit_date?: string;
-        cigarettes_per_day?: number;
-        pack_price?: number;
-    }
+    quitDate: Date,
+    cigarettesPerDay?: number,
+    packPrice?: number
 ): Promise<void> {
-    const { error } = await supabase
-        .from('antismoke_users')
-        .update({
-            ...data,
-            updated_at: new Date().toISOString(),
-        })
-        .eq('telegram_id', telegramId);
+    const updates: any = {
+        quit_date: quitDate.toISOString().split('T')[0],
+        updated_at: new Date().toISOString(),
+    };
 
-    if (error) {
-        console.error('[Supabase] Error updating quit data:', error);
+    if (cigarettesPerDay !== undefined) {
+        updates.cigarettes_per_day = cigarettesPerDay;
     }
+    if (packPrice !== undefined) {
+        updates.pack_price = packPrice;
+    }
+
+    await supabase
+        .from('antismoke_users')
+        .update(updates)
+        .eq('telegram_id', telegramId);
 }
 
 /**
- * Get user stats for admin
+ * Get user progress stats
+ */
+export async function getUserProgress(telegramId: string): Promise<{
+    quitDate: Date | null;
+    smokFreeDays: number;
+    cigarettesAvoided: number;
+    moneySaved: number;
+} | null> {
+    const user = await getOrCreateUser(telegramId);
+
+    if (!user.quit_date) return null;
+
+    const quitDate = new Date(user.quit_date);
+    const today = new Date();
+    const diffTime = today.getTime() - quitDate.getTime();
+    const smokFreeDays = Math.max(0, Math.floor(diffTime / (1000 * 60 * 60 * 24)));
+
+    const cigarettesPerDay = user.cigarettes_per_day || 20;
+    const packPrice = user.pack_price || 200;
+    const cigarettesPerPack = 20;
+
+    const cigarettesAvoided = smokFreeDays * cigarettesPerDay;
+    const packsAvoided = cigarettesAvoided / cigarettesPerPack;
+    const moneySaved = packsAvoided * packPrice;
+
+    return {
+        quitDate,
+        smokFreeDays,
+        cigarettesAvoided,
+        moneySaved: Math.round(moneySaved),
+    };
+}
+
+/**
+ * Get admin stats
  */
 export async function getAdminStats(): Promise<{
     totalUsers: number;
-    totalMessagesBought: number;
+    premiumUsers: number;
+    totalMessages: number;
     totalStarsEarned: number;
 }> {
     const { data, error } = await supabase
         .from('antismoke_users')
-        .select('total_messages_bought, total_stars_spent');
+        .select('is_premium, premium_until, total_messages, total_stars_spent');
 
     if (error || !data) {
-        return { totalUsers: 0, totalMessagesBought: 0, totalStarsEarned: 0 };
+        return { totalUsers: 0, premiumUsers: 0, totalMessages: 0, totalStarsEarned: 0 };
     }
+
+    const now = new Date();
+    const premiumUsers = data.filter(u =>
+        u.is_premium && u.premium_until && new Date(u.premium_until) > now
+    ).length;
 
     return {
         totalUsers: data.length,
-        totalMessagesBought: data.reduce((sum, u) => sum + (u.total_messages_bought || 0), 0),
+        premiumUsers,
+        totalMessages: data.reduce((sum, u) => sum + (u.total_messages || 0), 0),
         totalStarsEarned: data.reduce((sum, u) => sum + (u.total_stars_spent || 0), 0),
     };
 }
