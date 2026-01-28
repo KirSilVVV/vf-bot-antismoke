@@ -15,6 +15,10 @@ const EnvSchema = z.object({
 
     // Admin alerts
     ADMIN_CHAT_ID: z.string().optional(),
+
+    // Supabase
+    SUPABASE_URL: z.string().min(1, 'SUPABASE_URL is required'),
+    SUPABASE_KEY: z.string().min(1, 'SUPABASE_KEY is required'),
 });
 
 try {
